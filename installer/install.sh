@@ -374,61 +374,11 @@ spec:
     branch: $CLAWARR_BRANCH
 EOF
 
-  # Build FluxCD Kustomization — with optional VPN patch
-  local PATCHES_BLOCK=""
+  # Select FluxCD path based on VPN choice
+  local FLUX_PATH="./flux"
   if [ "$VPN_ENABLED" = "false" ]; then
-    log "VPN disabled — adding patch to use bare qBittorrent (no Gluetun)"
-    # FluxCD inline patch: replace the VPN deployment with the no-VPN version
-    read -r -d '' PATCHES_BLOCK <<'PATCHEOF' || true
-  patches:
-    - target:
-        kind: Deployment
-        name: qbittorrent
-        namespace: clawarr
-      patch: |
-        apiVersion: apps/v1
-        kind: Deployment
-        metadata:
-          name: qbittorrent
-          namespace: clawarr
-        spec:
-          template:
-            spec:
-              containers:
-                - name: qbittorrent
-                  image: linuxserver/qbittorrent:latest
-                  ports:
-                    - containerPort: 8080
-                      name: webui
-                  env:
-                    - name: PUID
-                      value: "1000"
-                    - name: PGID
-                      value: "1000"
-                    - name: TZ
-                      value: "${TIMEZONE}"
-                    - name: WEBUI_PORT
-                      value: "8080"
-                  volumeMounts:
-                    - name: config
-                      mountPath: /config
-                    - name: data
-                      mountPath: /data
-                  resources:
-                    requests:
-                      memory: "128Mi"
-                      cpu: "25m"
-                    limits:
-                      memory: "1Gi"
-                      cpu: "500m"
-              volumes:
-                - name: config
-                  persistentVolumeClaim:
-                    claimName: qbittorrent-config
-                - name: data
-                  persistentVolumeClaim:
-                    claimName: media-data
-PATCHEOF
+    log "VPN disabled — using no-VPN overlay (bare qBittorrent)"
+    FLUX_PATH="./flux/overlays/novpn"
   fi
 
   # Create FluxCD Kustomization with variable substitution
@@ -444,7 +394,7 @@ spec:
   sourceRef:
     kind: GitRepository
     name: clawarr
-  path: ./flux
+  path: $FLUX_PATH
   prune: true
   wait: true
   timeout: 10m
@@ -452,7 +402,6 @@ spec:
     substituteFrom:
       - kind: ConfigMap
         name: clawarr-user-config
-$PATCHES_BLOCK
 EOF
 
   log "FluxCD Kustomization created."

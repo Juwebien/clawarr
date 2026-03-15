@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qbittorrent
+  namespace: clawarr
+spec:
+  template:
+    spec:
+      containers:
+        # Remove gluetun by setting $patch: replace on the containers list
+        - $patch: delete
+          name: gluetun
+        # Keep qbittorrent but add ports (were on gluetun in VPN mode)
+        - name: qbittorrent
+          ports:
+            - containerPort: 8080
+              name: webui
+      volumes:
+        # Remove VPN-only volumes
+        - $patch: delete
+          name: gluetun-data
+        - $patch: delete
+          name: vpn-init
+        - $patch: delete
+          name: vpn-config
