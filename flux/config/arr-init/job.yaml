@@ -46,7 +46,7 @@ metadata:
   namespace: clawarr
 rules:
   - apiGroups: [""]
-    resources: ["pods", "pods/exec", "secrets"]
+    resources: ["pods", "pods/exec", "pods/log", "secrets"]
     verbs: ["get", "list", "create", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
