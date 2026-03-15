@@ -70,7 +70,7 @@ data:
     fi
 
     # Jellyfin: create an API key via its API (no config.xml)
-    JELLYFIN_URL="http://jellyfin.clawarr.svc.cluster.local:8096"
+    JELLYFIN_URL="http://jellyfin:8096"
     JELLYFIN_KEY=""
     echo "  Note: Jellyfin API key will be empty until initial setup is completed via the Jellyfin wizard."
 
@@ -91,38 +91,52 @@ data:
     # 4. Change qBittorrent default password
     #############################################
     echo "Configuring qBittorrent..."
-    QBIT_URL="http://qbittorrent.clawarr.svc.cluster.local:8080"
-    QBIT_PASS="adminadmin"
+    QBIT_URL="http://qbittorrent:8080"
+    QBIT_REFERER="-H Referer:$QBIT_URL"
+    QBIT_PASS=""
 
-    # Wait for qBit WebUI
+    # Wait for qBit WebUI (need Referer header for CSRF protection)
     for i in $(seq 1 30); do
-      if curl -sf "$QBIT_URL/api/v2/app/version" >/dev/null 2>&1; then break; fi
+      if curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/app/version" >/dev/null 2>&1; then break; fi
       echo "  Waiting for qBittorrent WebUI... ($i/30)"
       sleep 5
     done
 
-    # Login with default credentials
-    QBIT_COOKIE=$(curl -sf -c - "$QBIT_URL/api/v2/auth/login" \
-      -d "username=admin&password=adminadmin" 2>/dev/null | grep SID | awk '{print $NF}' || echo "")
+    # Get the temporary password from qBit logs (new qBit versions don't use adminadmin)
+    QBIT_POD=$(kubectl get pod -n $NAMESPACE -l app=qbittorrent -o jsonpath='{.items[0].metadata.name}')
+    TEMP_PASS=$(kubectl logs -n $NAMESPACE $QBIT_POD -c qbittorrent 2>/dev/null | \
+      sed -n 's/.*temporary password.*: //p' | tail -1)
+
+    if [ -z "$TEMP_PASS" ]; then
+      TEMP_PASS="adminadmin"
+      echo "  No temp password found in logs, trying adminadmin"
+    else
+      echo "  Found temporary password from logs"
+    fi
+
+    # Login
+    QBIT_COOKIE=$(curl -sf $QBIT_REFERER -c - "$QBIT_URL/api/v2/auth/login" \
+      -d "username=admin&password=$TEMP_PASS" 2>/dev/null | grep SID | awk '{print $NF}' || echo "")
 
     if [ -n "$QBIT_COOKIE" ]; then
       # Create download categories FIRST (before changing password)
-      curl -sf "$QBIT_URL/api/v2/torrents/createCategory" \
+      curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/torrents/createCategory" \
         -b "SID=$QBIT_COOKIE" \
         -d "category=movies&savePath=/data/downloads/movies" >/dev/null 2>&1 || true
-      curl -sf "$QBIT_URL/api/v2/torrents/createCategory" \
+      curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/torrents/createCategory" \
         -b "SID=$QBIT_COOKIE" \
         -d "category=tv&savePath=/data/downloads/tv" >/dev/null 2>&1 || true
       echo "  qBittorrent categories created (movies, tv)."
 
       # Generate and set new password
       QBIT_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
-      curl -sf "$QBIT_URL/api/v2/app/setPreferences" \
+      curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/app/setPreferences" \
         -b "SID=$QBIT_COOKIE" \
         --data-urlencode "json={\"web_ui_password\":\"$QBIT_PASS\"}" >/dev/null 2>&1 || true
       echo "  qBittorrent password changed."
     else
-      echo "  WARNING: Could not login to qBittorrent (password may already be changed)"
+      echo "  WARNING: Could not login to qBittorrent"
+      QBIT_PASS="$TEMP_PASS"
     fi
 
     # Store credentials in secret
@@ -136,7 +150,7 @@ data:
     # 5. Configure download client in Radarr
     #############################################
     echo "Configuring Radarr download client..."
-    RADARR_URL="http://radarr.clawarr.svc.cluster.local:7878"
+    RADARR_URL="http://radarr:7878"
 
     until curl -sf "$RADARR_URL/api/v3/system/status" -H "X-Api-Key: $RADARR_KEY" >/dev/null 2>&1; do
       sleep 3
@@ -186,7 +200,7 @@ data:
     # 6. Configure download client in Sonarr
     #############################################
     echo "Configuring Sonarr download client..."
-    SONARR_URL="http://sonarr.clawarr.svc.cluster.local:8989"
+    SONARR_URL="http://sonarr:8989"
 
     until curl -sf "$SONARR_URL/api/v3/system/status" -H "X-Api-Key: $SONARR_KEY" >/dev/null 2>&1; do
       sleep 3
@@ -253,7 +267,7 @@ data:
           "onMovieFileDelete": true,
           "onMovieFileDeleteForUpgrade": true,
           "fields": [
-            {"name": "host", "value": "jellyfin.clawarr.svc.cluster.local"},
+            {"name": "host", "value": "jellyfin"},
             {"name": "port", "value": 8096},
             {"name": "useSsl", "value": false},
             {"name": "apiKey", "value": ""},
@@ -281,7 +295,7 @@ data:
           "onEpisodeFileDelete": true,
           "onEpisodeFileDeleteForUpgrade": true,
           "fields": [
-            {"name": "host", "value": "jellyfin.clawarr.svc.cluster.local"},
+            {"name": "host", "value": "jellyfin"},
             {"name": "port", "value": 8096},
             {"name": "useSsl", "value": false},
             {"name": "apiKey", "value": ""},
@@ -357,7 +371,7 @@ data:
     # 9. Configure Prowlarr sync to Sonarr/Radarr
     #############################################
     echo "Configuring Prowlarr sync..."
-    PROWLARR_URL="http://prowlarr.clawarr.svc.cluster.local:9696"
+    PROWLARR_URL="http://prowlarr:9696"
 
     # Wait for Prowlarr API
     until curl -sf "$PROWLARR_URL/api/v1/system/status" -H "X-Api-Key: $PROWLARR_KEY" >/dev/null 2>&1; do

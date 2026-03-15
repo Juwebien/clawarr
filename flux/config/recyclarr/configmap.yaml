@@ -9,7 +9,7 @@ data:
 
     radarr:
       movies:
-        base_url: http://radarr.clawarr.svc.cluster.local:7878
+        base_url: http://radarr:7878
         api_key: !env_var RADARR_API_KEY
         delete_old_custom_formats: false
         replace_existing_custom_formats: false
@@ -21,7 +21,7 @@ data:
 
     sonarr:
       tv:
-        base_url: http://sonarr.clawarr.svc.cluster.local:8989
+        base_url: http://sonarr:8989
         api_key: !env_var SONARR_API_KEY
         delete_old_custom_formats: false
         replace_existing_custom_formats: false
