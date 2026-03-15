@@ -106,9 +106,9 @@ data:
     done
 
     # Get the temporary password from qBit logs (qBit 5.x generates a temp password)
-    # Don't specify -c flag — works for both VPN (multi-container) and no-VPN (single container)
-    TEMP_PASS=$(kubectl logs -n $NAMESPACE -l app=qbittorrent --all-containers 2>/dev/null | \
-      sed -n 's/.*temporary password[^:]*: *//p' | tail -1)
+    QBIT_POD=$(kubectl get pod -n $NAMESPACE -l app=qbittorrent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    QBIT_LOGS=$(kubectl logs -n $NAMESPACE "$QBIT_POD" 2>/dev/null || kubectl logs -n $NAMESPACE "$QBIT_POD" -c qbittorrent 2>/dev/null || echo "")
+    TEMP_PASS=$(echo "$QBIT_LOGS" | grep "temporary password" | sed 's/.*: //' | tr -d '[:space:]')
 
     if [ -z "$TEMP_PASS" ]; then
       TEMP_PASS="adminadmin"
