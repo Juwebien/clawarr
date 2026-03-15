@@ -1,0 +1,9 @@
+# Recyclarr profile for Radarr — HD Bluray + WEB
+# This is a reference file. The actual config used by the CronJob
+# is in flux/config/recyclarr/configmap.yaml with TRaSH Guide templates.
+#
+# Quality definitions: preferred_ratio uses default (balanced)
+# Templates used:
+#   - radarr-quality-definition-movie
+#   - radarr-quality-profile-hd-bluray-web
+#   - radarr-custom-formats-hd-bluray-web

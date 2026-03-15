@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+#############################################
+# ClaWArr CLI — Post-install management tool
+#############################################
+
+NAMESPACE="clawarr"
+FLUX_NS="flux-system"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+export KUBECONFIG="${KUBECONFIG:-/etc/rancher/k3s/k3s.yaml}"
+
+usage() {
+  echo -e "${BOLD}ClaWArr${NC} — Media server management CLI"
+  echo ""
+  echo "Usage: clawarr <command> [args]"
+  echo ""
+  echo "Commands:"
+  echo "  status              Show status of all ClaWArr pods"
+  echo "  logs [service]      Show logs (agent, sonarr, radarr, jellyfin, qbittorrent, prowlarr, webhook, arr-init)"
+  echo "  update              Force FluxCD reconciliation (pull latest from Git)"
+  echo "  expose <service>    Expose a service via NodePort (jellyfin, sonarr, radarr, prowlarr, qbittorrent)"
+  echo "  unexpose <service>  Remove NodePort exposure"
+  echo "  vpn status          Show VPN connection status"
+  echo "  vpn update <file>   Update VPN config"
+  echo "  config              Show current user configuration"
+  echo "  config set K=V      Set a configuration value"
+  echo "  restart [service]   Restart a service (or all)"
+  echo "  uninstall           Remove ClaWArr (keeps data)"
+  echo ""
+}
+
+cmd_status() {
+  echo -e "${BOLD}ClaWArr Status${NC}"
+  echo ""
+  kubectl get pods -n $NAMESPACE -o wide
+  echo ""
+
+  # FluxCD status
+  echo -e "${BOLD}FluxCD Reconciliation:${NC}"
+  flux get kustomization clawarr 2>/dev/null || echo "  FluxCD kustomization not found"
+  echo ""
+
+  # Node IP
+  local NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+  echo -e "${BOLD}Node IP:${NC} $NODE_IP"
+
+  # Exposed services
+  echo ""
+  echo -e "${BOLD}Exposed Services:${NC}"
+  kubectl get svc -n $NAMESPACE -o custom-columns="NAME:.metadata.name,TYPE:.spec.type,PORTS:.spec.ports[*].nodePort" | \
+    grep -v "^NAME" | while read line; do
+      echo "  $line"
+    done
+}
+
+cmd_logs() {
+  local service="${1:-agent}"
+
+  case "$service" in
+    agent|openclaw)
+      kubectl logs -n $NAMESPACE deployment/clawarr-agent -c openclaw -f --tail=100
+      ;;
+    webhook|bridge)
+      kubectl logs -n $NAMESPACE deployment/clawarr-agent -c webhook-bridge -f --tail=100
+      ;;
+    mc|mission-control)
+      kubectl logs -n $NAMESPACE deployment/clawarr-agent -c mission-control -f --tail=100
+      ;;
+    arr-init)
+      kubectl logs -n $NAMESPACE job/arr-init --tail=200
+      ;;
+    *)
+      kubectl logs -n $NAMESPACE deployment/$service -f --tail=100
+      ;;
+  esac
+}
+
+cmd_update() {
+  echo "Forcing FluxCD reconciliation..."
+  flux reconcile source git clawarr 2>/dev/null || true
+  flux reconcile kustomization clawarr --with-source
+  echo -e "${GREEN}Done.${NC} Waiting for pods..."
+  sleep 5
+  cmd_status
+}
+
+cmd_expose() {
+  local service="${1:-}"
+  if [ -z "$service" ]; then
+    echo "Usage: clawarr expose <service>"
+    echo "Services: jellyfin, sonarr, radarr, prowlarr, qbittorrent"
+    exit 1
+  fi
+
+  local port_map=(
+    "jellyfin:30096"
+    "sonarr:30989"
+    "radarr:30878"
+    "prowlarr:30696"
+    "qbittorrent:30080"
+  )
+
+  local node_port=""
+  for mapping in "${port_map[@]}"; do
+    local svc="${mapping%%:*}"
+    local np="${mapping##*:}"
+    if [ "$svc" = "$service" ]; then
+      node_port="$np"
+      break
+    fi
+  done
+
+  if [ -z "$node_port" ]; then
+    echo "Unknown service: $service"
+    exit 1
+  fi
+
+  # Patch the service directly to NodePort
+  kubectl patch svc "$service" -n $NAMESPACE \
+    --type merge -p "{\"spec\":{\"type\":\"NodePort\",\"ports\":[{\"name\":\"webui\",\"port\":$(kubectl get svc "$service" -n $NAMESPACE -o jsonpath='{.spec.ports[0].port}'),\"targetPort\":$(kubectl get svc "$service" -n $NAMESPACE -o jsonpath='{.spec.ports[0].targetPort}'),\"nodePort\":${node_port}}]}}"
+
+  local NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+  echo -e "${GREEN}$service exposed at${NC} http://${NODE_IP}:${node_port}"
+}
+
+cmd_unexpose() {
+  local service="${1:-}"
+  if [ -z "$service" ]; then
+    echo "Usage: clawarr unexpose <service>"
+    exit 1
+  fi
+
+  # Patch the service back to ClusterIP
+  kubectl patch svc "$service" -n $NAMESPACE \
+    --type merge -p '{"spec":{"type":"ClusterIP"}}'
+
+  # Remove nodePort field (ClusterIP doesn't support it)
+  kubectl patch svc "$service" -n $NAMESPACE \
+    --type json -p '[{"op":"remove","path":"/spec/ports/0/nodePort"}]' 2>/dev/null || true
+
+  echo -e "${GREEN}$service unexposed.${NC}"
+}
+
+cmd_config() {
+  if [ "${1:-}" = "set" ]; then
+    shift
+    local kv="$1"
+    local key="${kv%%=*}"
+    local val="${kv##*=}"
+    kubectl patch configmap clawarr-user-config -n $FLUX_NS \
+      --type merge -p "{\"data\":{\"$key\": \"$val\"}}"
+    echo "Set $key=$val"
+    echo "Run 'clawarr update' to apply changes."
+  else
+    echo -e "${BOLD}User Configuration:${NC}"
+    kubectl get configmap clawarr-user-config -n $FLUX_NS -o jsonpath='{.data}' | python3 -m json.tool 2>/dev/null || \
+      kubectl get configmap clawarr-user-config -n $FLUX_NS -o yaml
+  fi
+}
+
+cmd_vpn() {
+  local subcmd="${1:-status}"
+  case "$subcmd" in
+    status)
+      echo -e "${BOLD}VPN Status:${NC}"
+      local qbit_pod=$(kubectl get pod -n $NAMESPACE -l app=qbittorrent -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+      if [ -n "$qbit_pod" ]; then
+        kubectl exec -n $NAMESPACE "$qbit_pod" -c gluetun -- /gluetun-entrypoint healthcheck 2>/dev/null || \
+          echo "  Gluetun container not found (VPN may be disabled)"
+      fi
+      ;;
+    update)
+      local file="${2:-}"
+      if [ -z "$file" ] || [ ! -f "$file" ]; then
+        echo "Usage: clawarr vpn update <config-file>"
+        exit 1
+      fi
+      # Detect type
+      if [[ "$file" == *.conf ]]; then
+        local WG_KEY=$(grep -oP 'PrivateKey\s*=\s*\K.*' "$file" | tr -d ' ')
+        local WG_ADDR=$(grep -oP 'Address\s*=\s*\K.*' "$file" | tr -d ' ')
+        kubectl create secret generic clawarr-vpn -n $NAMESPACE \
+          --from-literal=WIREGUARD_PRIVATE_KEY="$WG_KEY" \
+          --from-literal=WIREGUARD_ADDRESSES="$WG_ADDR" \
+          --from-file=wg0.conf="$file" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      else
+        kubectl create secret generic clawarr-vpn -n $NAMESPACE \
+          --from-file=openvpn.conf="$file" \
+          --dry-run=client -o yaml | kubectl apply -f -
+      fi
+      kubectl rollout restart deployment/qbittorrent -n $NAMESPACE
+      echo -e "${GREEN}VPN config updated and qBittorrent restarted.${NC}"
+      ;;
+  esac
+}
+
+cmd_restart() {
+  local service="${1:-all}"
+  if [ "$service" = "all" ]; then
+    for deploy in sonarr radarr prowlarr qbittorrent jellyfin clawarr-agent; do
+      kubectl rollout restart deployment/$deploy -n $NAMESPACE 2>/dev/null || true
+    done
+    echo "All services restarting."
+  else
+    kubectl rollout restart deployment/$service -n $NAMESPACE
+    echo "$service restarting."
+  fi
+}
+
+cmd_uninstall() {
+  echo -e "${RED}${BOLD}WARNING:${NC} This will remove ClaWArr but keep your media data."
+  read -p "Are you sure? [y/N] " -r
+  [[ $REPLY =~ ^[Yy]$ ]] || exit 0
+
+  echo "Removing FluxCD resources..."
+  flux delete kustomization clawarr --silent 2>/dev/null || true
+  flux delete source git clawarr --silent 2>/dev/null || true
+
+  echo "Removing namespace..."
+  kubectl delete namespace $NAMESPACE --timeout=60s 2>/dev/null || true
+
+  echo "Removing ConfigMap..."
+  kubectl delete configmap clawarr-user-config -n $FLUX_NS 2>/dev/null || true
+
+  echo "Removing CLI..."
+  rm -f /usr/local/bin/clawarr
+
+  echo -e "${GREEN}ClaWArr removed.${NC} Your media data at $MEDIA_PATH is preserved."
+  echo "To also remove K3s: /usr/local/bin/k3s-uninstall.sh"
+}
+
+# Main dispatch
+case "${1:-}" in
+  status)       cmd_status ;;
+  logs)         shift; cmd_logs "$@" ;;
+  update)       cmd_update ;;
+  expose)       shift; cmd_expose "$@" ;;
+  unexpose)     shift; cmd_unexpose "$@" ;;
+  config)       shift; cmd_config "$@" ;;
+  vpn)          shift; cmd_vpn "$@" ;;
+  restart)      shift; cmd_restart "$@" ;;
+  uninstall)    cmd_uninstall ;;
+  -h|--help|"") usage ;;
+  *)            echo "Unknown command: $1"; usage; exit 1 ;;
+esac

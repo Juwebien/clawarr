@@ -1,0 +1,418 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: arr-init-scripts
+  namespace: clawarr
+data:
+  arr-init.sh: |
+    #!/bin/bash
+    set -euo pipefail
+
+    NAMESPACE="${NAMESPACE:-clawarr}"
+
+    echo "=== ClaWArr arr-init: Auto-configuration ==="
+
+    #############################################
+    # 1. Wait for all services to be ready
+    #############################################
+    wait_for_deploy() {
+      local name=$1
+      echo "Waiting for $name..."
+      kubectl rollout status deployment/$name -n $NAMESPACE --timeout=300s
+    }
+
+    wait_for_deploy sonarr
+    wait_for_deploy radarr
+    wait_for_deploy prowlarr
+    wait_for_deploy qbittorrent
+    wait_for_deploy jellyfin
+
+    echo "All services are running."
+
+    #############################################
+    # 2. API key discovery from config.xml
+    #############################################
+    get_api_key() {
+      local deploy=$1
+      local pod=$(kubectl get pod -n $NAMESPACE -l app=$deploy -o jsonpath='{.items[0].metadata.name}')
+      local container=$deploy
+
+      # Wait for config.xml to exist (app generates it on first start)
+      for i in $(seq 1 30); do
+        if kubectl exec -n $NAMESPACE $pod -c $container -- cat /config/config.xml 2>/dev/null | grep -q ApiKey; then
+          break
+        fi
+        echo "  Waiting for $deploy config.xml... ($i/30)"
+        sleep 5
+      done
+
+      kubectl exec -n $NAMESPACE $pod -c $container -- \
+        cat /config/config.xml 2>/dev/null | \
+        grep -oP '<ApiKey>\K[^<]+' || echo ""
+    }
+
+    echo "Discovering API keys..."
+    SONARR_KEY=$(get_api_key sonarr)
+    RADARR_KEY=$(get_api_key radarr)
+    PROWLARR_KEY=$(get_api_key prowlarr)
+
+    # Jellyfin needs special handling — no config.xml with API key
+    JELLYFIN_KEY=""
+    JELLYFIN_POD=$(kubectl get pod -n $NAMESPACE -l app=jellyfin -o jsonpath='{.items[0].metadata.name}')
+
+    echo "  Sonarr key: ${SONARR_KEY:0:8}..."
+    echo "  Radarr key: ${RADARR_KEY:0:8}..."
+    echo "  Prowlarr key: ${PROWLARR_KEY:0:8}..."
+
+    if [ -z "$SONARR_KEY" ] || [ -z "$RADARR_KEY" ] || [ -z "$PROWLARR_KEY" ]; then
+      echo "ERROR: Failed to discover one or more API keys"
+      exit 1
+    fi
+
+    #############################################
+    # 3. Create/update arr-keys Secret
+    #############################################
+    kubectl create secret generic clawarr-arr-keys \
+      -n $NAMESPACE \
+      --from-literal=SONARR_API_KEY="$SONARR_KEY" \
+      --from-literal=RADARR_API_KEY="$RADARR_KEY" \
+      --from-literal=PROWLARR_API_KEY="$PROWLARR_KEY" \
+      --from-literal=JELLYFIN_API_KEY="$JELLYFIN_KEY" \
+      --dry-run=client -o yaml | kubectl apply -f -
+
+    echo "Secret clawarr-arr-keys created/updated."
+
+    #############################################
+    # 4. Change qBittorrent default password
+    #############################################
+    echo "Configuring qBittorrent..."
+    QBIT_URL="http://qbittorrent.clawarr.svc.cluster.local:8080"
+
+    # Wait for qBit WebUI
+    for i in $(seq 1 30); do
+      if curl -sf "$QBIT_URL/api/v2/app/version" >/dev/null 2>&1; then break; fi
+      echo "  Waiting for qBittorrent WebUI... ($i/30)"
+      sleep 5
+    done
+
+    # Login with default credentials
+    QBIT_COOKIE=$(curl -sf -c - "$QBIT_URL/api/v2/auth/login" \
+      -d "username=admin&password=adminadmin" 2>/dev/null | grep SID | awk '{print $NF}')
+
+    if [ -n "$QBIT_COOKIE" ]; then
+      # Generate a random password
+      QBIT_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
+
+      # Change password
+      curl -sf "$QBIT_URL/api/v2/app/setPreferences" \
+        -b "SID=$QBIT_COOKIE" \
+        -d "json={\"web_ui_password\":\"$QBIT_PASS\"}" >/dev/null 2>&1 || true
+
+      # Store new password in secret
+      kubectl create secret generic clawarr-qbit-credentials \
+        -n $NAMESPACE \
+        --from-literal=QBIT_USERNAME=admin \
+        --from-literal=QBIT_PASSWORD="$QBIT_PASS" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+      echo "  qBittorrent password changed and stored in secret."
+
+      # Create download categories
+      curl -sf "$QBIT_URL/api/v2/torrents/createCategory" \
+        -b "SID=$QBIT_COOKIE" \
+        -d "category=movies&savePath=/data/downloads/movies" >/dev/null 2>&1 || true
+      curl -sf "$QBIT_URL/api/v2/torrents/createCategory" \
+        -b "SID=$QBIT_COOKIE" \
+        -d "category=tv&savePath=/data/downloads/tv" >/dev/null 2>&1 || true
+
+      echo "  qBittorrent categories created (movies, tv)."
+    else
+      echo "  WARNING: Could not login to qBittorrent (password may already be changed)"
+    fi
+
+    #############################################
+    # 5. Configure download client in Radarr
+    #############################################
+    echo "Configuring Radarr download client..."
+    RADARR_URL="http://radarr.clawarr.svc.cluster.local:7878"
+
+    # Wait for Radarr API
+    until curl -sf "$RADARR_URL/api/v3/system/status" -H "X-Api-Key: $RADARR_KEY" >/dev/null 2>&1; do
+      sleep 3
+    done
+
+    # Check if download client already exists
+    EXISTING_DC=$(curl -sf "$RADARR_URL/api/v3/downloadclient" -H "X-Api-Key: $RADARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(d['name']=='qBittorrent' for d in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_DC" ]; then
+      curl -sf "$RADARR_URL/api/v3/downloadclient" \
+        -H "X-Api-Key: $RADARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d "{
+          \"name\": \"qBittorrent\",
+          \"implementation\": \"QBittorrent\",
+          \"configContract\": \"QBittorrentSettings\",
+          \"enable\": true,
+          \"protocol\": \"torrent\",
+          \"fields\": [
+            {\"name\": \"host\", \"value\": \"qbittorrent\"},
+            {\"name\": \"port\", \"value\": 8080},
+            {\"name\": \"username\", \"value\": \"admin\"},
+            {\"name\": \"password\", \"value\": \"${QBIT_PASS:-adminadmin}\"},
+            {\"name\": \"movieCategory\", \"value\": \"movies\"},
+            {\"name\": \"firstAndLast\", \"value\": false},
+            {\"name\": \"sequentialOrder\", \"value\": false}
+          ]
+        }" >/dev/null
+      echo "  Radarr download client configured."
+    else
+      echo "  Radarr download client already exists."
+    fi
+
+    # Add root folder if missing
+    EXISTING_RF=$(curl -sf "$RADARR_URL/api/v3/rootfolder" -H "X-Api-Key: $RADARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(r['path']=='/data/movies' for r in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_RF" ]; then
+      curl -sf "$RADARR_URL/api/v3/rootfolder" \
+        -H "X-Api-Key: $RADARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d '{"path": "/data/movies"}' >/dev/null
+      echo "  Radarr root folder /data/movies configured."
+    fi
+
+    #############################################
+    # 6. Configure download client in Sonarr
+    #############################################
+    echo "Configuring Sonarr download client..."
+    SONARR_URL="http://sonarr.clawarr.svc.cluster.local:8989"
+
+    until curl -sf "$SONARR_URL/api/v3/system/status" -H "X-Api-Key: $SONARR_KEY" >/dev/null 2>&1; do
+      sleep 3
+    done
+
+    EXISTING_DC=$(curl -sf "$SONARR_URL/api/v3/downloadclient" -H "X-Api-Key: $SONARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(d['name']=='qBittorrent' for d in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_DC" ]; then
+      curl -sf "$SONARR_URL/api/v3/downloadclient" \
+        -H "X-Api-Key: $SONARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d "{
+          \"name\": \"qBittorrent\",
+          \"implementation\": \"QBittorrent\",
+          \"configContract\": \"QBittorrentSettings\",
+          \"enable\": true,
+          \"protocol\": \"torrent\",
+          \"fields\": [
+            {\"name\": \"host\", \"value\": \"qbittorrent\"},
+            {\"name\": \"port\", \"value\": 8080},
+            {\"name\": \"username\", \"value\": \"admin\"},
+            {\"name\": \"password\", \"value\": \"${QBIT_PASS:-adminadmin}\"},
+            {\"name\": \"tvCategory\", \"value\": \"tv\"},
+            {\"name\": \"firstAndLast\", \"value\": false},
+            {\"name\": \"sequentialOrder\", \"value\": false}
+          ]
+        }" >/dev/null
+      echo "  Sonarr download client configured."
+    else
+      echo "  Sonarr download client already exists."
+    fi
+
+    # Add root folder if missing
+    EXISTING_RF=$(curl -sf "$SONARR_URL/api/v3/rootfolder" -H "X-Api-Key: $SONARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(r['path']=='/data/tv' for r in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_RF" ]; then
+      curl -sf "$SONARR_URL/api/v3/rootfolder" \
+        -H "X-Api-Key: $SONARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d '{"path": "/data/tv"}' >/dev/null
+      echo "  Sonarr root folder /data/tv configured."
+    fi
+
+    #############################################
+    # 7. Configure Jellyfin notifications
+    #############################################
+    echo "Configuring Jellyfin notifications..."
+
+    # Radarr → Jellyfin notification
+    EXISTING_NOTIF=$(curl -sf "$RADARR_URL/api/v3/notification" -H "X-Api-Key: $RADARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='Jellyfin' for n in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_NOTIF" ]; then
+      curl -sf "$RADARR_URL/api/v3/notification" \
+        -H "X-Api-Key: $RADARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d '{
+          "name": "Jellyfin",
+          "implementation": "MediaBrowser",
+          "configContract": "MediaBrowserSettings",
+          "onDownload": true,
+          "onUpgrade": true,
+          "onMovieFileDelete": true,
+          "onMovieFileDeleteForUpgrade": true,
+          "fields": [
+            {"name": "host", "value": "jellyfin.clawarr.svc.cluster.local"},
+            {"name": "port", "value": 8096},
+            {"name": "useSsl", "value": false},
+            {"name": "apiKey", "value": ""},
+            {"name": "sendNotifications", "value": false},
+            {"name": "updateLibrary", "value": true}
+          ]
+        }' >/dev/null
+      echo "  Radarr → Jellyfin notification added."
+    fi
+
+    # Sonarr → Jellyfin notification
+    EXISTING_NOTIF=$(curl -sf "$SONARR_URL/api/v3/notification" -H "X-Api-Key: $SONARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='Jellyfin' for n in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_NOTIF" ]; then
+      curl -sf "$SONARR_URL/api/v3/notification" \
+        -H "X-Api-Key: $SONARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d '{
+          "name": "Jellyfin",
+          "implementation": "MediaBrowser",
+          "configContract": "MediaBrowserSettings",
+          "onDownload": true,
+          "onUpgrade": true,
+          "onEpisodeFileDelete": true,
+          "onEpisodeFileDeleteForUpgrade": true,
+          "fields": [
+            {"name": "host", "value": "jellyfin.clawarr.svc.cluster.local"},
+            {"name": "port", "value": 8096},
+            {"name": "useSsl", "value": false},
+            {"name": "apiKey", "value": ""},
+            {"name": "sendNotifications", "value": false},
+            {"name": "updateLibrary", "value": true}
+          ]
+        }' >/dev/null
+      echo "  Sonarr → Jellyfin notification added."
+    fi
+
+    #############################################
+    # 8. Configure webhook bridge
+    #############################################
+    echo "Configuring webhook bridge notifications..."
+    WEBHOOK_URL="http://localhost:8095"  # intra-pod, same network namespace
+
+    # Radarr → webhook bridge
+    EXISTING_WH=$(curl -sf "$RADARR_URL/api/v3/notification" -H "X-Api-Key: $RADARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='ClaWArr Webhook' for n in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_WH" ]; then
+      curl -sf "$RADARR_URL/api/v3/notification" \
+        -H "X-Api-Key: $RADARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d "{
+          \"name\": \"ClaWArr Webhook\",
+          \"implementation\": \"Webhook\",
+          \"configContract\": \"WebhookSettings\",
+          \"onDownload\": true,
+          \"onUpgrade\": true,
+          \"onGrab\": true,
+          \"onMovieAdded\": true,
+          \"onHealthIssue\": true,
+          \"onHealthRestored\": true,
+          \"onManualInteractionRequired\": true,
+          \"fields\": [
+            {\"name\": \"url\", \"value\": \"$WEBHOOK_URL/webhook/radarr\"},
+            {\"name\": \"method\", \"value\": 1}
+          ]
+        }" >/dev/null
+      echo "  Radarr → ClaWArr webhook added."
+    fi
+
+    # Sonarr → webhook bridge
+    EXISTING_WH=$(curl -sf "$SONARR_URL/api/v3/notification" -H "X-Api-Key: $SONARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='ClaWArr Webhook' for n in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_WH" ]; then
+      curl -sf "$SONARR_URL/api/v3/notification" \
+        -H "X-Api-Key: $SONARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d "{
+          \"name\": \"ClaWArr Webhook\",
+          \"implementation\": \"Webhook\",
+          \"configContract\": \"WebhookSettings\",
+          \"onDownload\": true,
+          \"onUpgrade\": true,
+          \"onGrab\": true,
+          \"onSeriesAdd\": true,
+          \"onHealthIssue\": true,
+          \"onHealthRestored\": true,
+          \"onManualInteractionRequired\": true,
+          \"onImportComplete\": true,
+          \"fields\": [
+            {\"name\": \"url\", \"value\": \"$WEBHOOK_URL/webhook/sonarr\"},
+            {\"name\": \"method\", \"value\": 1}
+          ]
+        }" >/dev/null
+      echo "  Sonarr → ClaWArr webhook added."
+    fi
+
+    #############################################
+    # 9. Configure Prowlarr sync to Sonarr/Radarr
+    #############################################
+    echo "Configuring Prowlarr sync..."
+
+    # Add Radarr as application in Prowlarr
+    EXISTING_APP=$(curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+      -H "X-Api-Key: $PROWLARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(a['name']=='Radarr' for a in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_APP" ]; then
+      curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+        -H "X-Api-Key: $PROWLARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d "{
+          \"name\": \"Radarr\",
+          \"implementation\": \"Radarr\",
+          \"configContract\": \"RadarrSettings\",
+          \"syncLevel\": \"fullSync\",
+          \"fields\": [
+            {\"name\": \"prowlarrUrl\", \"value\": \"http://prowlarr:9696\"},
+            {\"name\": \"baseUrl\", \"value\": \"http://radarr:7878\"},
+            {\"name\": \"apiKey\", \"value\": \"$RADARR_KEY\"},
+            {\"name\": \"syncCategories\", \"value\": [2000, 2010, 2020, 2030, 2040, 2045, 2050, 2060]}
+          ]
+        }" >/dev/null
+      echo "  Prowlarr → Radarr sync configured."
+    fi
+
+    # Add Sonarr as application in Prowlarr
+    EXISTING_APP=$(curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+      -H "X-Api-Key: $PROWLARR_KEY" | \
+      python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(a['name']=='Sonarr' for a in data) else '')" 2>/dev/null || echo "")
+
+    if [ -z "$EXISTING_APP" ]; then
+      curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+        -H "X-Api-Key: $PROWLARR_KEY" \
+        -H "Content-Type: application/json" \
+        -X POST -d "{
+          \"name\": \"Sonarr\",
+          \"implementation\": \"Sonarr\",
+          \"configContract\": \"SonarrSettings\",
+          \"syncLevel\": \"fullSync\",
+          \"fields\": [
+            {\"name\": \"prowlarrUrl\", \"value\": \"http://prowlarr:9696\"},
+            {\"name\": \"baseUrl\", \"value\": \"http://sonarr:8989\"},
+            {\"name\": \"apiKey\", \"value\": \"$SONARR_KEY\"},
+            {\"name\": \"syncCategories\", \"value\": [5000, 5010, 5020, 5030, 5040, 5045, 5050]}
+          ]
+        }" >/dev/null
+      echo "  Prowlarr → Sonarr sync configured."
+    fi
+
+    #############################################
+    # 10. Restart agent to pick up new secrets
+    #############################################
+    echo "Restarting clawarr-agent to pick up API keys..."
+    kubectl rollout restart deployment/clawarr-agent -n $NAMESPACE 2>/dev/null || true
+
+    echo ""
+    echo "=== ClaWArr arr-init complete! ==="
+    echo "All services wired. The agent will configure quality profiles and indexers on first user contact."

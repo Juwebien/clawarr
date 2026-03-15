@@ -1,0 +1,202 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clawarr-agent
+  namespace: clawarr
+  labels:
+    app: clawarr-agent
+    app.kubernetes.io/part-of: clawarr
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: clawarr-agent
+  template:
+    metadata:
+      labels:
+        app: clawarr-agent
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+
+      containers:
+        # --- Container 1: OpenClaw Gateway ---
+        - name: openclaw
+          image: ghcr.io/openclaw/openclaw:latest
+          imagePullPolicy: Always
+          command: ["node", "openclaw.mjs", "gateway", "--port", "18789", "--bind", "lan", "--allow-unconfigured"]
+          ports:
+            - containerPort: 18789
+              name: gateway
+          env:
+            - name: HOME
+              value: "/home/openclaw"
+            - name: XDG_CACHE_HOME
+              value: "/home/openclaw/.openclaw/.cache"
+            - name: XDG_CONFIG_HOME
+              value: "/home/openclaw/.openclaw/.config"
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-agent-secrets
+                  key: ANTHROPIC_API_KEY
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-agent-secrets
+                  key: TELEGRAM_BOT_TOKEN
+            - name: OPENCLAW_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-agent-secrets
+                  key: OPENCLAW_GATEWAY_TOKEN
+            - name: RADARR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-arr-keys
+                  key: RADARR_API_KEY
+                  optional: true
+            - name: SONARR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-arr-keys
+                  key: SONARR_API_KEY
+                  optional: true
+            - name: JELLYFIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-arr-keys
+                  key: JELLYFIN_API_KEY
+                  optional: true
+            - name: PROWLARR_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-arr-keys
+                  key: PROWLARR_API_KEY
+                  optional: true
+          volumeMounts:
+            - name: openclaw-state
+              mountPath: /home/openclaw/.openclaw
+            - name: openclaw-config
+              mountPath: /home/openclaw/.openclaw/openclaw.json
+              subPath: openclaw.json
+            - name: workspace
+              mountPath: /home/openclaw/.openclaw/workspace/
+            - name: skill-media
+              mountPath: /home/openclaw/.openclaw/workspace/skills/media-stack/
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "200m"
+            limits:
+              memory: "3Gi"
+              cpu: "2000m"
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 18789
+            failureThreshold: 30
+            periodSeconds: 10
+            initialDelaySeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 18789
+            periodSeconds: 30
+            timeoutSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 18789
+            periodSeconds: 10
+
+        # --- Container 2: Mission Control (sidecar) ---
+        - name: mission-control
+          image: ghcr.io/openclaw/mission-control:latest
+          ports:
+            - containerPort: 3000
+              name: web-ui
+          env:
+            - name: OPENCLAW_GATEWAY_HOST
+              value: "localhost"
+            - name: OPENCLAW_GATEWAY_PORT
+              value: "18789"
+            - name: OPENCLAW_HOME
+              value: "/home/openclaw/.openclaw"
+            - name: NODE_ENV
+              value: "production"
+            - name: DATABASE_URL
+              value: "file:/app/.data/mission-control.db"
+            - name: OPENCLAW_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-agent-secrets
+                  key: OPENCLAW_GATEWAY_TOKEN
+          volumeMounts:
+            - name: openclaw-state
+              mountPath: /home/openclaw/.openclaw
+            - name: mc-data
+              mountPath: /app/.data
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+        # --- Container 3: Webhook Bridge (sidecar) ---
+        - name: webhook-bridge
+          image: node:22-alpine
+          command: ["node", "/app/bridge.mjs"]
+          ports:
+            - containerPort: 8095
+              name: webhook
+          env:
+            - name: OPENCLAW_GATEWAY_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-agent-secrets
+                  key: OPENCLAW_GATEWAY_TOKEN
+            - name: JELLYFIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-arr-keys
+                  key: JELLYFIN_API_KEY
+                  optional: true
+            - name: WEBHOOK_MODEL
+              value: "anthropic/claude-sonnet-4-6"
+          volumeMounts:
+            - name: webhook-bridge-script
+              mountPath: /app
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "10m"
+            limits:
+              memory: "64Mi"
+              cpu: "100m"
+
+      volumes:
+        - name: openclaw-state
+          persistentVolumeClaim:
+            claimName: openclaw-state
+        - name: mc-data
+          emptyDir:
+            sizeLimit: 1Gi
+        - name: openclaw-config
+          configMap:
+            name: clawarr-openclaw-config
+        - name: workspace
+          configMap:
+            name: clawarr-workspace
+        - name: skill-media
+          configMap:
+            name: clawarr-skill-media
+        - name: webhook-bridge-script
+          configMap:
+            name: clawarr-webhook-bridge

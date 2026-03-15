@@ -1,0 +1,63 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: arr-init
+  namespace: clawarr
+  labels:
+    app.kubernetes.io/part-of: clawarr
+spec:
+  ttlSecondsAfterFinished: 600
+  backoffLimit: 5
+  template:
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: arr-init
+      containers:
+        - name: arr-init
+          image: bitnami/kubectl:latest
+          command: ["/bin/bash", "/scripts/arr-init.sh"]
+          env:
+            - name: NAMESPACE
+              value: "clawarr"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: arr-init-scripts
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: arr-init
+  namespace: clawarr
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: arr-init
+  namespace: clawarr
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/exec", "secrets"]
+    verbs: ["get", "list", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: arr-init
+  namespace: clawarr
+subjects:
+  - kind: ServiceAccount
+    name: arr-init
+    namespace: clawarr
+roleRef:
+  kind: Role
+  name: arr-init
+  apiGroup: rbac.authorization.k8s.io

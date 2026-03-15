@@ -1,0 +1,29 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+configMapGenerator:
+  - name: clawarr-openclaw-config
+    namespace: clawarr
+    files:
+      - openclaw.json=configmap-openclaw.json
+  - name: clawarr-workspace
+    namespace: clawarr
+    files:
+      - SOUL.md=workspace/SOUL.md
+      - TOOLS.md=workspace/TOOLS.md
+  - name: clawarr-skill-media
+    namespace: clawarr
+    files:
+      - SKILL.md=workspace/skills/media-stack/SKILL.md
+  - name: clawarr-webhook-bridge
+    namespace: clawarr
+    files:
+      - bridge.mjs=webhook/bridge.mjs
+
+generatorOptions:
+  disableNameSuffixHash: true

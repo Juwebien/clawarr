@@ -1,0 +1,9 @@
+# Recyclarr profile for Sonarr — WEB 1080p
+# This is a reference file. The actual config used by the CronJob
+# is in flux/config/recyclarr/configmap.yaml with TRaSH Guide templates.
+#
+# Quality definitions: preferred_ratio uses default (balanced)
+# Templates used:
+#   - sonarr-quality-definition-series
+#   - sonarr-v4-quality-profile-web-1080p
+#   - sonarr-v4-custom-formats-web-1080p

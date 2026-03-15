@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: qbittorrent-vpn-init
+  namespace: clawarr
+data:
+  99-vpn-interface.sh: |
+    #!/bin/bash
+    # Force qBittorrent to bind to tun0 (VPN interface)
+    # Without this, libtorrent binds to eth0 (pod IP) which gets
+    # blocked by Gluetun's iptables OUTPUT DROP policy.
+    CONF="/config/qBittorrent/qBittorrent.conf"
+    mkdir -p /config/qBittorrent
+
+    if [ ! -f "$CONF" ]; then
+      echo "[99-vpn-interface] Config not found, creating with tun0 binding"
+      cat > "$CONF" << 'EOCONF'
+    [BitTorrent]
+    Session\Interface=tun0
+    Session\InterfaceName=tun0
+    Session\AddTrackersEnabled=true
+
+    [Preferences]
+    WebUI\Port=8080
+    EOCONF
+      exit 0
+    fi
+
+    echo "[99-vpn-interface] Ensuring Session\Interface=tun0 in config"
+
+    # Ensure [BitTorrent] section exists
+    if ! grep -q '^\[BitTorrent\]' "$CONF"; then
+      echo -e "\n[BitTorrent]" >> "$CONF"
+    fi
+
+    # Set Session\Interface=tun0
+    if grep -q '^Session\\Interface=' "$CONF"; then
+      sed -i 's/^Session\\Interface=.*/Session\\Interface=tun0/' "$CONF"
+    else
+      sed -i '/^\[BitTorrent\]/a Session\\Interface=tun0' "$CONF"
+    fi
+
+    # Set Session\InterfaceName=tun0
+    if grep -q '^Session\\InterfaceName=' "$CONF"; then
+      sed -i 's/^Session\\InterfaceName=.*/Session\\InterfaceName=tun0/' "$CONF"
+    else
+      sed -i '/^\[BitTorrent\]/a Session\\InterfaceName=tun0' "$CONF"
+    fi
+
+    echo "[99-vpn-interface] Done - qBittorrent will bind to tun0"

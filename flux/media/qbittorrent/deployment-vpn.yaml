@@ -1,0 +1,128 @@
+---
+# qBittorrent deployment WITH Gluetun VPN sidecar
+# Used when VPN_ENABLED=true (default if VPN config provided)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qbittorrent
+  namespace: clawarr
+  labels:
+    app: qbittorrent
+    app.kubernetes.io/part-of: clawarr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: qbittorrent
+  template:
+    metadata:
+      labels:
+        app: qbittorrent
+    spec:
+      containers:
+        # VPN Sidecar — all traffic routes through this
+        - name: gluetun
+          image: qmcgaw/gluetun:latest
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          env:
+            - name: VPN_SERVICE_PROVIDER
+              value: "${VPN_PROVIDER}"
+            - name: VPN_TYPE
+              value: "${VPN_TYPE}"
+            - name: WIREGUARD_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-vpn
+                  key: WIREGUARD_PRIVATE_KEY
+                  optional: true
+            - name: WIREGUARD_ADDRESSES
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-vpn
+                  key: WIREGUARD_ADDRESSES
+                  optional: true
+            - name: OPENVPN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-vpn
+                  key: OPENVPN_USER
+                  optional: true
+            - name: OPENVPN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: clawarr-vpn
+                  key: OPENVPN_PASSWORD
+                  optional: true
+            - name: FIREWALL_OUTBOUND_SUBNETS
+              value: "10.0.0.0/8,192.168.0.0/16,172.16.0.0/12"
+            - name: FIREWALL_VPN_INPUT_PORTS
+              value: "6881"
+            - name: HTTPPROXY
+              value: "off"
+            - name: SHADOWSOCKS
+              value: "off"
+          ports:
+            - containerPort: 8080
+              name: webui
+              protocol: TCP
+          volumeMounts:
+            - name: gluetun-data
+              mountPath: /gluetun
+            - name: vpn-config
+              mountPath: /gluetun/wireguard
+              readOnly: true
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+
+        # qBittorrent — uses gluetun's network namespace
+        - name: qbittorrent
+          image: linuxserver/qbittorrent:latest
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: TZ
+              value: "${TIMEZONE}"
+            - name: WEBUI_PORT
+              value: "8080"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /data
+            - name: vpn-init
+              mountPath: /custom-cont-init.d/99-vpn-interface.sh
+              subPath: 99-vpn-interface.sh
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "25m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+
+      volumes:
+        - name: config
+          persistentVolumeClaim:
+            claimName: qbittorrent-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: media-data
+        - name: gluetun-data
+          emptyDir: {}
+        - name: vpn-init
+          configMap:
+            name: qbittorrent-vpn-init
+            defaultMode: 0755
+        - name: vpn-config
+          secret:
+            secretName: clawarr-vpn
+            optional: true

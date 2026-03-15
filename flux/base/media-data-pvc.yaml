@@ -1,0 +1,31 @@
+---
+# Shared media data PVC — storage backend depends on user config
+# For hostPath: the installer creates the PV pointing to MEDIA_PATH
+# For NFS/SMB: the installer creates PV with appropriate CSI driver
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-data
+  namespace: clawarr
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  volumeName: clawarr-media-data
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: clawarr-media-data
+spec:
+  capacity:
+    storage: 100Gi
+  accessModes: [ReadWriteMany]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ""
+  # Default: hostPath — overwritten by installer for NFS/SMB
+  hostPath:
+    path: ${MEDIA_PATH}
+    type: DirectoryOrCreate

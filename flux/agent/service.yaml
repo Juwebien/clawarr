@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: clawarr-agent
+  namespace: clawarr
+spec:
+  type: ClusterIP
+  selector:
+    app: clawarr-agent
+  ports:
+    - name: gateway
+      port: 18789
+      targetPort: 18789
+    - name: webhook
+      port: 8095
+      targetPort: 8095
+    - name: mission-control
+      port: 3000
+      targetPort: 3000
