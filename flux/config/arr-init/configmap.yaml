@@ -5,8 +5,8 @@ metadata:
   namespace: clawarr
 data:
   arr-init.sh: |
-    #!/bin/bash
-    set -euo pipefail
+    #!/bin/sh
+    set -eu
 
     NAMESPACE="${NAMESPACE:-clawarr}"
 
@@ -29,15 +29,18 @@ data:
 
     echo "All services are running."
 
+    # Give apps time to generate config.xml on first start
+    sleep 15
+
     #############################################
     # 2. API key discovery from config.xml
     #############################################
     get_api_key() {
       local deploy=$1
-      local pod=$(kubectl get pod -n $NAMESPACE -l app=$deploy -o jsonpath='{.items[0].metadata.name}')
+      local pod
+      pod=$(kubectl get pod -n $NAMESPACE -l app=$deploy -o jsonpath='{.items[0].metadata.name}')
       local container=$deploy
 
-      # Wait for config.xml to exist (app generates it on first start)
       for i in $(seq 1 30); do
         if kubectl exec -n $NAMESPACE $pod -c $container -- cat /config/config.xml 2>/dev/null | grep -q ApiKey; then
           break
@@ -46,9 +49,10 @@ data:
         sleep 5
       done
 
+      # Extract ApiKey using sed (no grep -oP dependency)
       kubectl exec -n $NAMESPACE $pod -c $container -- \
         cat /config/config.xml 2>/dev/null | \
-        grep -oP '<ApiKey>\K[^<]+' || echo ""
+        sed -n 's/.*<ApiKey>\([^<]*\)<\/ApiKey>.*/\1/p' | head -1
     }
 
     echo "Discovering API keys..."
@@ -56,18 +60,19 @@ data:
     RADARR_KEY=$(get_api_key radarr)
     PROWLARR_KEY=$(get_api_key prowlarr)
 
-    # Jellyfin needs special handling — no config.xml with API key
-    JELLYFIN_KEY=""
-    JELLYFIN_POD=$(kubectl get pod -n $NAMESPACE -l app=jellyfin -o jsonpath='{.items[0].metadata.name}')
-
-    echo "  Sonarr key: ${SONARR_KEY:0:8}..."
-    echo "  Radarr key: ${RADARR_KEY:0:8}..."
-    echo "  Prowlarr key: ${PROWLARR_KEY:0:8}..."
+    echo "  Sonarr key: $(echo "$SONARR_KEY" | cut -c1-8)..."
+    echo "  Radarr key: $(echo "$RADARR_KEY" | cut -c1-8)..."
+    echo "  Prowlarr key: $(echo "$PROWLARR_KEY" | cut -c1-8)..."
 
     if [ -z "$SONARR_KEY" ] || [ -z "$RADARR_KEY" ] || [ -z "$PROWLARR_KEY" ]; then
       echo "ERROR: Failed to discover one or more API keys"
       exit 1
     fi
+
+    # Jellyfin: create an API key via its API (no config.xml)
+    JELLYFIN_URL="http://jellyfin.clawarr.svc.cluster.local:8096"
+    JELLYFIN_KEY=""
+    echo "  Note: Jellyfin API key will be empty until initial setup is completed via the Jellyfin wizard."
 
     #############################################
     # 3. Create/update arr-keys Secret
@@ -87,6 +92,7 @@ data:
     #############################################
     echo "Configuring qBittorrent..."
     QBIT_URL="http://qbittorrent.clawarr.svc.cluster.local:8080"
+    QBIT_PASS="adminadmin"
 
     # Wait for qBit WebUI
     for i in $(seq 1 30); do
@@ -97,38 +103,34 @@ data:
 
     # Login with default credentials
     QBIT_COOKIE=$(curl -sf -c - "$QBIT_URL/api/v2/auth/login" \
-      -d "username=admin&password=adminadmin" 2>/dev/null | grep SID | awk '{print $NF}')
+      -d "username=admin&password=adminadmin" 2>/dev/null | grep SID | awk '{print $NF}' || echo "")
 
     if [ -n "$QBIT_COOKIE" ]; then
-      # Generate a random password
-      QBIT_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
-
-      # Change password
-      curl -sf "$QBIT_URL/api/v2/app/setPreferences" \
-        -b "SID=$QBIT_COOKIE" \
-        -d "json={\"web_ui_password\":\"$QBIT_PASS\"}" >/dev/null 2>&1 || true
-
-      # Store new password in secret
-      kubectl create secret generic clawarr-qbit-credentials \
-        -n $NAMESPACE \
-        --from-literal=QBIT_USERNAME=admin \
-        --from-literal=QBIT_PASSWORD="$QBIT_PASS" \
-        --dry-run=client -o yaml | kubectl apply -f -
-
-      echo "  qBittorrent password changed and stored in secret."
-
-      # Create download categories
+      # Create download categories FIRST (before changing password)
       curl -sf "$QBIT_URL/api/v2/torrents/createCategory" \
         -b "SID=$QBIT_COOKIE" \
         -d "category=movies&savePath=/data/downloads/movies" >/dev/null 2>&1 || true
       curl -sf "$QBIT_URL/api/v2/torrents/createCategory" \
         -b "SID=$QBIT_COOKIE" \
         -d "category=tv&savePath=/data/downloads/tv" >/dev/null 2>&1 || true
-
       echo "  qBittorrent categories created (movies, tv)."
+
+      # Generate and set new password
+      QBIT_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
+      curl -sf "$QBIT_URL/api/v2/app/setPreferences" \
+        -b "SID=$QBIT_COOKIE" \
+        --data-urlencode "json={\"web_ui_password\":\"$QBIT_PASS\"}" >/dev/null 2>&1 || true
+      echo "  qBittorrent password changed."
     else
       echo "  WARNING: Could not login to qBittorrent (password may already be changed)"
     fi
+
+    # Store credentials in secret
+    kubectl create secret generic clawarr-qbit-credentials \
+      -n $NAMESPACE \
+      --from-literal=QBIT_USERNAME=admin \
+      --from-literal=QBIT_PASSWORD="$QBIT_PASS" \
+      --dry-run=client -o yaml | kubectl apply -f -
 
     #############################################
     # 5. Configure download client in Radarr
@@ -136,12 +138,10 @@ data:
     echo "Configuring Radarr download client..."
     RADARR_URL="http://radarr.clawarr.svc.cluster.local:7878"
 
-    # Wait for Radarr API
     until curl -sf "$RADARR_URL/api/v3/system/status" -H "X-Api-Key: $RADARR_KEY" >/dev/null 2>&1; do
       sleep 3
     done
 
-    # Check if download client already exists
     EXISTING_DC=$(curl -sf "$RADARR_URL/api/v3/downloadclient" -H "X-Api-Key: $RADARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(d['name']=='qBittorrent' for d in data) else '')" 2>/dev/null || echo "")
 
@@ -159,7 +159,7 @@ data:
             {\"name\": \"host\", \"value\": \"qbittorrent\"},
             {\"name\": \"port\", \"value\": 8080},
             {\"name\": \"username\", \"value\": \"admin\"},
-            {\"name\": \"password\", \"value\": \"${QBIT_PASS:-adminadmin}\"},
+            {\"name\": \"password\", \"value\": \"$QBIT_PASS\"},
             {\"name\": \"movieCategory\", \"value\": \"movies\"},
             {\"name\": \"firstAndLast\", \"value\": false},
             {\"name\": \"sequentialOrder\", \"value\": false}
@@ -209,7 +209,7 @@ data:
             {\"name\": \"host\", \"value\": \"qbittorrent\"},
             {\"name\": \"port\", \"value\": 8080},
             {\"name\": \"username\", \"value\": \"admin\"},
-            {\"name\": \"password\", \"value\": \"${QBIT_PASS:-adminadmin}\"},
+            {\"name\": \"password\", \"value\": \"$QBIT_PASS\"},
             {\"name\": \"tvCategory\", \"value\": \"tv\"},
             {\"name\": \"firstAndLast\", \"value\": false},
             {\"name\": \"sequentialOrder\", \"value\": false}
@@ -220,7 +220,6 @@ data:
       echo "  Sonarr download client already exists."
     fi
 
-    # Add root folder if missing
     EXISTING_RF=$(curl -sf "$SONARR_URL/api/v3/rootfolder" -H "X-Api-Key: $SONARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(r['path']=='/data/tv' for r in data) else '')" 2>/dev/null || echo "")
 
@@ -237,7 +236,7 @@ data:
     #############################################
     echo "Configuring Jellyfin notifications..."
 
-    # Radarr → Jellyfin notification
+    # Radarr -> Jellyfin
     EXISTING_NOTIF=$(curl -sf "$RADARR_URL/api/v3/notification" -H "X-Api-Key: $RADARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='Jellyfin' for n in data) else '')" 2>/dev/null || echo "")
 
@@ -262,10 +261,10 @@ data:
             {"name": "updateLibrary", "value": true}
           ]
         }' >/dev/null
-      echo "  Radarr → Jellyfin notification added."
+      echo "  Radarr -> Jellyfin notification added."
     fi
 
-    # Sonarr → Jellyfin notification
+    # Sonarr -> Jellyfin
     EXISTING_NOTIF=$(curl -sf "$SONARR_URL/api/v3/notification" -H "X-Api-Key: $SONARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='Jellyfin' for n in data) else '')" 2>/dev/null || echo "")
 
@@ -290,16 +289,16 @@ data:
             {"name": "updateLibrary", "value": true}
           ]
         }' >/dev/null
-      echo "  Sonarr → Jellyfin notification added."
+      echo "  Sonarr -> Jellyfin notification added."
     fi
 
     #############################################
-    # 8. Configure webhook bridge
+    # 8. Configure webhook bridge (inter-pod!)
     #############################################
     echo "Configuring webhook bridge notifications..."
-    WEBHOOK_URL="http://localhost:8095"  # intra-pod, same network namespace
+    WEBHOOK_URL="http://clawarr-agent:8095"
 
-    # Radarr → webhook bridge
+    # Radarr -> webhook bridge
     EXISTING_WH=$(curl -sf "$RADARR_URL/api/v3/notification" -H "X-Api-Key: $RADARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='ClaWArr Webhook' for n in data) else '')" 2>/dev/null || echo "")
 
@@ -323,10 +322,10 @@ data:
             {\"name\": \"method\", \"value\": 1}
           ]
         }" >/dev/null
-      echo "  Radarr → ClaWArr webhook added."
+      echo "  Radarr -> ClaWArr webhook added."
     fi
 
-    # Sonarr → webhook bridge
+    # Sonarr -> webhook bridge
     EXISTING_WH=$(curl -sf "$SONARR_URL/api/v3/notification" -H "X-Api-Key: $SONARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(n['name']=='ClaWArr Webhook' for n in data) else '')" 2>/dev/null || echo "")
 
@@ -351,21 +350,28 @@ data:
             {\"name\": \"method\", \"value\": 1}
           ]
         }" >/dev/null
-      echo "  Sonarr → ClaWArr webhook added."
+      echo "  Sonarr -> ClaWArr webhook added."
     fi
 
     #############################################
     # 9. Configure Prowlarr sync to Sonarr/Radarr
     #############################################
     echo "Configuring Prowlarr sync..."
+    PROWLARR_URL="http://prowlarr.clawarr.svc.cluster.local:9696"
 
-    # Add Radarr as application in Prowlarr
-    EXISTING_APP=$(curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+    # Wait for Prowlarr API
+    until curl -sf "$PROWLARR_URL/api/v1/system/status" -H "X-Api-Key: $PROWLARR_KEY" >/dev/null 2>&1; do
+      echo "  Waiting for Prowlarr API..."
+      sleep 5
+    done
+
+    # Add Radarr as application
+    EXISTING_APP=$(curl -sf "$PROWLARR_URL/api/v1/applications" \
       -H "X-Api-Key: $PROWLARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(a['name']=='Radarr' for a in data) else '')" 2>/dev/null || echo "")
 
     if [ -z "$EXISTING_APP" ]; then
-      curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+      curl -sf "$PROWLARR_URL/api/v1/applications" \
         -H "X-Api-Key: $PROWLARR_KEY" \
         -H "Content-Type: application/json" \
         -X POST -d "{
@@ -380,16 +386,16 @@ data:
             {\"name\": \"syncCategories\", \"value\": [2000, 2010, 2020, 2030, 2040, 2045, 2050, 2060]}
           ]
         }" >/dev/null
-      echo "  Prowlarr → Radarr sync configured."
+      echo "  Prowlarr -> Radarr sync configured."
     fi
 
-    # Add Sonarr as application in Prowlarr
-    EXISTING_APP=$(curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+    # Add Sonarr as application
+    EXISTING_APP=$(curl -sf "$PROWLARR_URL/api/v1/applications" \
       -H "X-Api-Key: $PROWLARR_KEY" | \
       python3 -c "import json,sys; data=json.load(sys.stdin); print('exists' if any(a['name']=='Sonarr' for a in data) else '')" 2>/dev/null || echo "")
 
     if [ -z "$EXISTING_APP" ]; then
-      curl -sf "http://prowlarr.clawarr.svc.cluster.local:9696/api/v1/applications" \
+      curl -sf "$PROWLARR_URL/api/v1/applications" \
         -H "X-Api-Key: $PROWLARR_KEY" \
         -H "Content-Type: application/json" \
         -X POST -d "{
@@ -404,7 +410,7 @@ data:
             {\"name\": \"syncCategories\", \"value\": [5000, 5010, 5020, 5030, 5040, 5045, 5050]}
           ]
         }" >/dev/null
-      echo "  Prowlarr → Sonarr sync configured."
+      echo "  Prowlarr -> Sonarr sync configured."
     fi
 
     #############################################

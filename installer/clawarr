@@ -234,7 +234,9 @@ cmd_uninstall() {
   echo "Removing CLI..."
   rm -f /usr/local/bin/clawarr
 
-  echo -e "${GREEN}ClaWArr removed.${NC} Your media data at $MEDIA_PATH is preserved."
+  local MEDIA_PATH
+  MEDIA_PATH=$(kubectl get configmap clawarr-user-config -n $FLUX_NS -o jsonpath='{.data.MEDIA_PATH}' 2>/dev/null || echo "/srv/clawarr")
+  echo -e "${GREEN}ClaWArr removed.${NC} Your media data at ${MEDIA_PATH} is preserved."
   echo "To also remove K3s: /usr/local/bin/k3s-uninstall.sh"
 }
 

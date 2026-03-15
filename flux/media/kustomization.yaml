@@ -2,7 +2,10 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
-  # qBittorrent — VPN or no-VPN variant selected by installer
+  # qBittorrent — deployment file is selected by installer:
+  # VPN enabled:  deployment-vpn.yaml (default, includes Gluetun sidecar)
+  # VPN disabled: deployment-novpn.yaml (bare qBittorrent)
+  # The installer patches this kustomization to select the right variant.
   - qbittorrent/configmap.yaml
   - qbittorrent/deployment-vpn.yaml
   - qbittorrent/service.yaml

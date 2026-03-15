@@ -7,7 +7,7 @@ metadata:
   labels:
     app.kubernetes.io/part-of: clawarr
 spec:
-  ttlSecondsAfterFinished: 600
+  ttlSecondsAfterFinished: 3600
   backoffLimit: 5
   template:
     spec:
@@ -15,8 +15,12 @@ spec:
       serviceAccountName: arr-init
       containers:
         - name: arr-init
-          image: bitnami/kubectl:latest
-          command: ["/bin/bash", "/scripts/arr-init.sh"]
+          image: alpine:3.20
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              apk add --no-cache curl python3 kubectl > /dev/null 2>&1
+              /bin/sh /scripts/arr-init.sh
           env:
             - name: NAMESPACE
               value: "clawarr"
@@ -46,6 +50,9 @@ rules:
     verbs: ["get", "list", "create", "update", "patch"]
   - apiGroups: ["apps"]
     resources: ["deployments"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
