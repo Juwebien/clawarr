@@ -5,6 +5,7 @@ resources:
   - pvc.yaml
   - deployment.yaml
   - service.yaml
+  - configmap-webhook.yaml
 
 configMapGenerator:
   - name: clawarr-openclaw-config
@@ -20,10 +21,6 @@ configMapGenerator:
     namespace: clawarr
     files:
       - SKILL.md=workspace/skills/media-stack/SKILL.md
-  - name: clawarr-webhook-bridge
-    namespace: clawarr
-    files:
-      - bridge.mjs=webhook/bridge.mjs
 
 generatorOptions:
   disableNameSuffixHash: true
