@@ -7,16 +7,39 @@ spec:
   template:
     spec:
       containers:
-        # Remove gluetun by setting $patch: replace on the containers list
+        # Remove gluetun sidecar
         - $patch: delete
           name: gluetun
-        # Keep qbittorrent but add ports (were on gluetun in VPN mode)
+        # Replace qbittorrent container entirely to remove vpn-init volumeMount and add ports
         - name: qbittorrent
+          image: linuxserver/qbittorrent:latest
           ports:
             - containerPort: 8080
               name: webui
+          env:
+            - name: PUID
+              value: "1000"
+            - name: PGID
+              value: "1000"
+            - name: TZ
+              value: "${TIMEZONE}"
+            - name: WEBUI_PORT
+              value: "8080"
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /data
+            - $patch: delete
+              name: vpn-init
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "25m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
       volumes:
-        # Remove VPN-only volumes
         - $patch: delete
           name: gluetun-data
         - $patch: delete
