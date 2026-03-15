@@ -6,7 +6,7 @@ metadata:
 data:
   arr-init.sh: |
     #!/bin/sh
-    set -eu
+    set -u
 
     NAMESPACE="${NAMESPACE:-clawarr}"
 
