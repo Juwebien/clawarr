@@ -92,50 +92,56 @@ data:
     #############################################
     echo "Configuring qBittorrent..."
     QBIT_URL="http://qbittorrent:8080"
-    QBIT_REFERER="-H Referer:$QBIT_URL"
     QBIT_PASS=""
 
-    # Wait for qBit WebUI (need Referer header for CSRF protection)
+    # Wait for qBit WebUI to respond (any HTTP response = ready)
     for i in $(seq 1 30); do
-      if curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/app/version" >/dev/null 2>&1; then break; fi
+      HTTP_CODE=$(curl -so /dev/null -w '%{http_code}' "$QBIT_URL/" 2>/dev/null || echo "000")
+      if [ "$HTTP_CODE" != "000" ]; then
+        echo "  qBittorrent WebUI responding (HTTP $HTTP_CODE)"
+        break
+      fi
       echo "  Waiting for qBittorrent WebUI... ($i/30)"
       sleep 5
     done
 
-    # Get the temporary password from qBit logs (new qBit versions don't use adminadmin)
+    # Get the temporary password from qBit logs (qBit 5.x generates a temp password)
     QBIT_POD=$(kubectl get pod -n $NAMESPACE -l app=qbittorrent -o jsonpath='{.items[0].metadata.name}')
     TEMP_PASS=$(kubectl logs -n $NAMESPACE $QBIT_POD -c qbittorrent 2>/dev/null | \
       sed -n 's/.*temporary password.*: //p' | tail -1)
 
     if [ -z "$TEMP_PASS" ]; then
       TEMP_PASS="adminadmin"
-      echo "  No temp password found in logs, trying adminadmin"
+      echo "  No temp password in logs, trying adminadmin"
     else
-      echo "  Found temporary password from logs"
+      echo "  Found temporary password: ${TEMP_PASS}"
     fi
 
-    # Login
-    QBIT_COOKIE=$(curl -sf $QBIT_REFERER -c - "$QBIT_URL/api/v2/auth/login" \
-      -d "username=admin&password=$TEMP_PASS" 2>/dev/null | grep SID | awk '{print $NF}' || echo "")
+    # Login (try the login endpoint — it returns Ok. or Fails.)
+    LOGIN_RESP=$(curl -s -c /tmp/qbit_cookies.txt "$QBIT_URL/api/v2/auth/login" \
+      -d "username=admin&password=$TEMP_PASS" 2>/dev/null || echo "")
+    QBIT_COOKIE=$(grep SID /tmp/qbit_cookies.txt 2>/dev/null | awk '{print $NF}' || echo "")
+
+    echo "  Login response: $LOGIN_RESP (SID: ${QBIT_COOKIE:+found}${QBIT_COOKIE:-empty})"
 
     if [ -n "$QBIT_COOKIE" ]; then
-      # Create download categories FIRST (before changing password)
-      curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/torrents/createCategory" \
+      # Create download categories
+      curl -s "$QBIT_URL/api/v2/torrents/createCategory" \
         -b "SID=$QBIT_COOKIE" \
         -d "category=movies&savePath=/data/downloads/movies" >/dev/null 2>&1 || true
-      curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/torrents/createCategory" \
+      curl -s "$QBIT_URL/api/v2/torrents/createCategory" \
         -b "SID=$QBIT_COOKIE" \
         -d "category=tv&savePath=/data/downloads/tv" >/dev/null 2>&1 || true
       echo "  qBittorrent categories created (movies, tv)."
 
       # Generate and set new password
       QBIT_PASS=$(head -c 16 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 16)
-      curl -sf $QBIT_REFERER "$QBIT_URL/api/v2/app/setPreferences" \
+      curl -s "$QBIT_URL/api/v2/app/setPreferences" \
         -b "SID=$QBIT_COOKIE" \
         --data-urlencode "json={\"web_ui_password\":\"$QBIT_PASS\"}" >/dev/null 2>&1 || true
       echo "  qBittorrent password changed."
     else
-      echo "  WARNING: Could not login to qBittorrent"
+      echo "  WARNING: Could not login to qBittorrent (will use temp password)"
       QBIT_PASS="$TEMP_PASS"
     fi
 
